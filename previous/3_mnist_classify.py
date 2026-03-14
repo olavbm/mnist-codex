@@ -27,7 +27,8 @@ def load_labels(path: Path) -> np.ndarray:
 
 
 def binarize(image: np.ndarray) -> np.ndarray:
-    return image >= 48
+    threshold = max(32, int(image.mean() * 0.75))
+    return image >= threshold
 
 
 def crop_to_foreground(mask: np.ndarray) -> np.ndarray:
