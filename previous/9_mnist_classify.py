@@ -246,6 +246,7 @@ class DigitClassifier:
         row_width_80 = features["row_width_80"]
         col_top_50 = features["col_top_50"]
         col_top_80 = features["col_top_80"]
+
         if digit == 0:
             return (
                 8.0 * (holes == 1.0)
@@ -407,18 +408,10 @@ class DigitClassifier:
         second_digit: int,
     ) -> int:
         pair = {best_digit, second_digit}
-        if pair == {3, 5} and abs(scores[3] - scores[5]) <= 2.0:
-            if features["row_left_50"] < 0.133:
+        if pair == {3, 5} and abs(scores[3] - scores[5]) <= 1.5:
+            if features["row_left_50"] < 0.12:
                 return 5
             return 3
-        if pair == {4, 9} and abs(scores[4] - scores[9]) <= 2.5:
-            if features["top"] < 0.295:
-                return 4
-            return 9
-        if pair == {5, 6} and abs(scores[5] - scores[6]) <= 2.5:
-            if features["row_left_20"] < 0.25:
-                return 5
-            return 6
         return best_digit
 
 
