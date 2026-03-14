@@ -457,26 +457,22 @@ class DigitClassifier:
             ):
                 return 2
             return 8
-        if pair == {2, 3} and abs(scores[2] - scores[3]) <= 3.0:
-            if features["lower_left"] >= 0.415:
-                return 2
-            return 3
-        if pair == {2, 6} and abs(scores[2] - scores[6]) <= 3.0:
-            if features["row_left_50"] >= 0.357:
+        if pair == {2, 6} and abs(scores[2] - scores[6]) <= 2.5:
+            if features["row_left_50"] > 0.3 and features["row_width_80"] > 0.52:
                 return 2
             return 6
-        if pair == {4, 9} and abs(scores[4] - scores[9]) <= 3.5:
-            if features["col_top_50"] >= 0.182:
+        if pair == {4, 9} and abs(scores[4] - scores[9]) <= 2.5:
+            if features["top"] < 0.295 or features["col_top_50"] > 0.18:
                 return 4
             return 9
         if pair == {5, 6} and abs(scores[5] - scores[6]) <= 2.5:
             if features["row_left_20"] < 0.25:
                 return 5
             return 6
-        if pair == {6, 8} and abs(scores[6] - scores[8]) <= 3.0:
-            if features["hr35"] <= 1.0:
-                return 6
-            return 8
+        if pair == {6, 8} and abs(scores[6] - scores[8]) <= 2.5:
+            if features["top"] > 0.28 and abs(features["top"] - features["bottom"]) < 0.09:
+                return 8
+            return 6
         return best_digit
 
 
