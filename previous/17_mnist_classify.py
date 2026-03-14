@@ -290,7 +290,9 @@ class DigitClassifier:
         diag_balance = main_diag_runs - anti_diag_runs
         sweeping_two = row_left_50 > 0.42 and row_width_50 < 0.32 and row_width_80 > 0.5
         repaired_loop = repaired_holes == 1.0 and repaired_largest_hole > 0.08
-        broken_loop_zero = holes == 0.0 and repaired_loop
+        broken_loop_zero = (
+            holes == 0.0 and repaired_loop
+        )
         balanced_zero = abs(left - right) < 0.1 and abs(top - bottom) < 0.1 and row_width_80 > 0.42
         broken_loop_nine = (
             holes == 0.0
@@ -299,20 +301,6 @@ class DigitClassifier:
             and top > bottom * 1.3
             and row_left_80 > 0.35
             and row_width_80 < 0.28
-        )
-        broken_loop_six = (
-            holes == 0.0
-            and repaired_holes == 1.0
-            and repaired_largest_hole > 0.02
-            and bottom > top * 1.25
-            and hr80 >= 1.8
-        )
-        slashed_nine = (
-            holes == 0.0
-            and top > bottom * 1.45
-            and row_left_50 > 0.45
-            and row_width_50 < 0.24
-            and vc50 >= 2.0
         )
         if digit == 0:
             return (
@@ -412,7 +400,6 @@ class DigitClassifier:
         if digit == 6:
             return (
                 8.0 * (holes == 1.0)
-                + 3.0 * broken_loop_six
                 + 3.5
                 * (
                     holes == 0.0
@@ -455,7 +442,6 @@ class DigitClassifier:
                 9.0 * (holes >= 2.0)
                 + 5.0 * (holes == 1.0)
                 + 3.0 * (repaired_holes >= 2.0)
-                + 1.5 * (holes == 1.0 and left >= right * 1.05 and hr50 <= 1.2)
                 + 1.5 * (holes == 1.0 and repaired_holes >= 2.0)
                 + 2.0 * features["vertical_symmetry"]
                 + 2.0 * features["horizontal_symmetry"]
@@ -472,7 +458,6 @@ class DigitClassifier:
             return (
                 8.0 * (holes == 1.0)
                 + 3.5 * broken_loop_nine
-                + 3.0 * slashed_nine
                 + 3.5 * (hole_y < 0.42)
                 + 2.5 * (top > bottom * 1.35)
                 + 2.0 * (right >= left * 1.05)
@@ -530,14 +515,6 @@ class DigitClassifier:
                 return 4
             return 9
         if pair == {5, 6} and abs(scores[5] - scores[6]) <= 2.5:
-            if features["repaired_holes"] == 1.0 and features["repaired_largest_hole"] > 0.02:
-                return 6
-            if (
-                features["bottom"] > features["top"] * 1.25
-                and features["hr80"] >= 1.8
-                and features["main_diag_runs"] >= features["anti_diag_runs"]
-            ):
-                return 6
             if features["row_left_20"] < 0.25:
                 return 5
             return 6
@@ -545,21 +522,6 @@ class DigitClassifier:
             if features["hr35"] <= 1.0:
                 return 6
             return 8
-        if pair == {7, 9} and abs(scores[7] - scores[9]) <= 3.0:
-            if (
-                features["top"] > features["bottom"] * 1.45
-                and features["row_left_50"] > 0.45
-                and features["row_width_50"] < 0.24
-                and features["vc50"] >= 2.0
-            ):
-                return 9
-            return 7
-        if pair == {8, 9} and abs(scores[8] - scores[9]) <= 3.0:
-            if features["holes"] >= 2.0 or features["repaired_holes"] >= 2.0:
-                return 8
-            if features["holes"] == 1.0 and features["left"] >= features["right"] * 1.05:
-                return 8
-            return 9
         return best_digit
 
 
