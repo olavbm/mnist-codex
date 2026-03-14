@@ -515,11 +515,6 @@ class DigitClassifier:
                 and features["row_left_50"] < 0.24
             ):
                 return 5
-            if (
-                features["left"] > features["right"] * 1.08
-                and features["anti_diag_runs"] > features["main_diag_runs"] + 0.25
-            ):
-                return 5
             if features["right"] > features["left"] * 1.1 and features["row_left_50"] > 0.22:
                 return 3
             if features["anti_diag_runs"] > features["main_diag_runs"] + 0.2 and features["row_left_50"] < 0.26:
@@ -574,14 +569,6 @@ class DigitClassifier:
             if features["holes"] >= 2.0 or features["repaired_holes"] >= 2.0:
                 return 8
             if features["holes"] == 1.0 and features["left"] >= features["right"] * 1.05:
-                return 8
-            if (
-                features["holes"] == 1.0
-                and features["hr80"] >= 1.2
-                and features["row_left_80"] < 0.24
-                and features["repaired_largest_hole"] > 0.035
-                and features["lower_left"] > features["lower_right"] * 1.35
-            ):
                 return 8
             return 9
         return best_digit
