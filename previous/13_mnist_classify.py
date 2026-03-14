@@ -263,7 +263,6 @@ class DigitClassifier:
         main_diag_runs = features["main_diag_runs"]
         anti_diag_runs = features["anti_diag_runs"]
         diag_balance = main_diag_runs - anti_diag_runs
-        sweeping_two = row_left_50 > 0.42 and row_width_50 < 0.32 and row_width_80 > 0.5
         if digit == 0:
             return (
                 8.0 * (holes == 1.0)
@@ -302,7 +301,6 @@ class DigitClassifier:
                 + 1.5 * (row_left_50 > 0.4)
                 + 1.5 * (row_width_80 > 0.5)
                 + 1.5 * (row_left_20 < 0.38)
-                + 2.0 * sweeping_two
                 + 1.5 * (main_diag_runs >= anti_diag_runs + 0.2)
                 - 1.5 * (row_left_50 < 0.3)
                 - 2.0 * (holes == 0.0)
@@ -448,19 +446,13 @@ class DigitClassifier:
                 return 3
             if features["anti_diag_runs"] > features["main_diag_runs"] + 0.2 and features["row_left_50"] < 0.26:
                 return 5
-            if features["row_left_50"] < 0.14:
+            if features["row_left_50"] < 0.18:
                 return 5
             return 3
         if pair == {2, 8} and abs(scores[2] - scores[8]) <= 2.5:
-            if features["row_left_50"] > 0.45 and (
-                features["top"] < 0.34 or features["hole_y"] > 0.62
-            ):
+            if features["row_left_50"] > 0.45 and features["top"] < 0.34:
                 return 2
             return 8
-        if pair == {2, 6} and abs(scores[2] - scores[6]) <= 2.5:
-            if features["row_left_50"] > 0.3 and features["row_width_80"] > 0.52:
-                return 2
-            return 6
         if pair == {4, 9} and abs(scores[4] - scores[9]) <= 2.5:
             if features["top"] < 0.295:
                 return 4
@@ -468,10 +460,6 @@ class DigitClassifier:
         if pair == {5, 6} and abs(scores[5] - scores[6]) <= 2.5:
             if features["row_left_20"] < 0.25:
                 return 5
-            return 6
-        if pair == {6, 8} and abs(scores[6] - scores[8]) <= 2.5:
-            if features["top"] > 0.28 and abs(features["top"] - features["bottom"]) < 0.09:
-                return 8
             return 6
         return best_digit
 
