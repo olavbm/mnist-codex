@@ -19,3 +19,5 @@ You are effectively hill climbing training accuracy using interpretable code, em
 # Flow
 
 Before starting work, backup the current script into the previous/ directory. Give it a filename based on the version, starting at 1 and increasing based on the existing files.
+
+After you complete your change, make a git commit describing briefly what you changed. Put the accuracy at the start of the commit msg.
