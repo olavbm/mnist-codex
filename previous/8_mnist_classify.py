@@ -394,24 +394,13 @@ class DigitClassifier:
 
     def classify(self, image: np.ndarray) -> int:
         features = extract_features(image)
-        scores = [self.score_digit(features, digit) for digit in range(10)]
-        order = sorted(range(10), key=lambda digit: scores[digit], reverse=True)
-        best_digit = order[0]
-        second_digit = order[1]
-        return self.break_tie(features, scores, best_digit, second_digit)
-
-    def break_tie(
-        self,
-        features: dict[str, float],
-        scores: list[float],
-        best_digit: int,
-        second_digit: int,
-    ) -> int:
-        pair = {best_digit, second_digit}
-        if pair == {3, 5} and abs(scores[3] - scores[5]) <= 1.5:
-            if features["row_left_50"] < 0.12:
-                return 5
-            return 3
+        best_digit = 0
+        best_score = self.score_digit(features, 0)
+        for digit in range(1, 10):
+            score = self.score_digit(features, digit)
+            if score > best_score:
+                best_score = score
+                best_digit = digit
         return best_digit
 
 
