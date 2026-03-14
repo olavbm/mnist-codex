@@ -84,24 +84,6 @@ def diagonal_runs(mask: np.ndarray, reverse: bool = False) -> float:
     return count_foreground_runs(np.array(line, dtype=bool))
 
 
-def close_small_gaps(mask: np.ndarray) -> np.ndarray:
-    closed = mask.copy()
-    h, w = mask.shape
-
-    for y in range(1, h - 1):
-        for x in range(1, w - 1):
-            if mask[y, x]:
-                continue
-            horizontal_gap = mask[y, x - 1] and mask[y, x + 1]
-            vertical_gap = mask[y - 1, x] and mask[y + 1, x]
-            main_diagonal_gap = mask[y - 1, x - 1] and mask[y + 1, x + 1]
-            anti_diagonal_gap = mask[y - 1, x + 1] and mask[y + 1, x - 1]
-            if horizontal_gap or vertical_gap or main_diagonal_gap or anti_diagonal_gap:
-                closed[y, x] = True
-
-    return closed
-
-
 def connected_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
     h, w = mask.shape
     seen = np.zeros((h, w), dtype=bool)
@@ -167,9 +149,7 @@ def extract_features(image: np.ndarray) -> dict[str, float]:
             "center_y": 0.5,
             "center_x": 0.5,
             "holes": 0.0,
-            "repaired_holes": 0.0,
             "largest_hole": 0.0,
-            "repaired_largest_hole": 0.0,
             "hole_y": 0.5,
             "hole_x": 0.5,
             "top": 0.0,
@@ -212,16 +192,13 @@ def extract_features(image: np.ndarray) -> dict[str, float]:
 
     ys, xs = np.where(mask)
     holes = find_holes(mask)
-    repaired_holes = find_holes(close_small_gaps(mask))
     features = {
         "aspect_ratio": w / h,
         "fill": float(mask.mean()),
         "center_y": float(ys.mean() / h),
         "center_x": float(xs.mean() / w),
         "holes": float(len(holes)),
-        "repaired_holes": float(len(repaired_holes)),
         "largest_hole": float(max((hole[0] for hole in holes), default=0.0)),
-        "repaired_largest_hole": float(max((hole[0] for hole in repaired_holes), default=0.0)),
         "hole_y": float(sum(hole[1] for hole in holes) / len(holes)) if holes else 0.5,
         "hole_x": float(sum(hole[2] for hole in holes) / len(holes)) if holes else 0.5,
         "top": region_density(mask, 0.0, 0.33, 0.0, 1.0),
@@ -261,9 +238,7 @@ def extract_features(image: np.ndarray) -> dict[str, float]:
 class DigitClassifier:
     def score_digit(self, features: dict[str, float], digit: int) -> float:
         holes = features["holes"]
-        repaired_holes = features["repaired_holes"]
         largest_hole = features["largest_hole"]
-        repaired_largest_hole = features["repaired_largest_hole"]
         top = features["top"]
         middle = features["middle"]
         bottom = features["bottom"]
@@ -289,24 +264,9 @@ class DigitClassifier:
         anti_diag_runs = features["anti_diag_runs"]
         diag_balance = main_diag_runs - anti_diag_runs
         sweeping_two = row_left_50 > 0.42 and row_width_50 < 0.32 and row_width_80 > 0.5
-        repaired_loop = repaired_holes == 1.0 and repaired_largest_hole > 0.08
-        broken_loop_zero = (
-            holes == 0.0 and repaired_loop
-        )
-        balanced_zero = abs(left - right) < 0.1 and abs(top - bottom) < 0.1 and row_width_80 > 0.42
-        broken_loop_nine = (
-            holes == 0.0
-            and repaired_holes == 1.0
-            and repaired_largest_hole > 0.03
-            and top > bottom * 1.3
-            and row_left_80 > 0.35
-            and row_width_80 < 0.28
-        )
         if digit == 0:
             return (
                 8.0 * (holes == 1.0)
-                + 4.0 * broken_loop_zero
-                + 1.0 * balanced_zero
                 + 3.5 * features["vertical_symmetry"]
                 + 2.5 * (1.6 <= hr50 <= 2.4)
                 + 2.0 * (1.6 <= vc50 <= 2.4)
@@ -374,7 +334,6 @@ class DigitClassifier:
                 + 1.5 * (right >= left * 0.9)
                 + 1.0 * (vc50 <= 1.4)
                 + 1.0 * (middle > bottom * 2.2)
-                - 2.0 * broken_loop_nine
                 - 0.5 * (col_top_50 < 0.14)
             )
         if digit == 5:
@@ -391,7 +350,6 @@ class DigitClassifier:
                 + 0.5 * (col_top_80 < 0.12)
                 + 1.0 * (left > right * 1.2)
                 + 1.5 * (anti_diag_runs >= main_diag_runs + 0.5)
-                - 2.0 * broken_loop_zero
                 - 1.0 * (bottom > top * 1.2)
                 - 1.0 * (main_diag_runs >= anti_diag_runs + 0.4)
                 - 1.0 * (row_left_50 > 0.32)
@@ -441,8 +399,6 @@ class DigitClassifier:
             return (
                 9.0 * (holes >= 2.0)
                 + 5.0 * (holes == 1.0)
-                + 3.0 * (repaired_holes >= 2.0)
-                + 1.5 * (holes == 1.0 and repaired_holes >= 2.0)
                 + 2.0 * features["vertical_symmetry"]
                 + 2.0 * features["horizontal_symmetry"]
                 + 2.0 * (hr20 >= 1.5)
@@ -457,7 +413,6 @@ class DigitClassifier:
         if digit == 9:
             return (
                 8.0 * (holes == 1.0)
-                + 3.5 * broken_loop_nine
                 + 3.5 * (hole_y < 0.42)
                 + 2.5 * (top > bottom * 1.35)
                 + 2.0 * (right >= left * 1.05)
