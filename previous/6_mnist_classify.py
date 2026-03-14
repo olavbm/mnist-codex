@@ -170,12 +170,6 @@ def extract_features(image: np.ndarray) -> dict[str, float]:
             "row_width_20": 0.0,
             "row_width_50": 0.0,
             "row_width_80": 0.0,
-            "col_top_20": 0.5,
-            "col_top_50": 0.5,
-            "col_top_80": 0.5,
-            "col_height_20": 0.0,
-            "col_height_50": 0.0,
-            "col_height_80": 0.0,
         }
 
     ys, xs = np.where(mask)
@@ -213,11 +207,6 @@ def extract_features(image: np.ndarray) -> dict[str, float]:
         row_left, _, row_width = line_edges(mask[y, :])
         features[f"row_left_{level}"] = row_left
         features[f"row_width_{level}"] = row_width
-    for level in span_levels:
-        x = int(round((level / 100.0) * (w - 1)))
-        col_top, _, col_height = line_edges(mask[:, x])
-        features[f"col_top_{level}"] = col_top
-        features[f"col_height_{level}"] = col_height
     return features
 
 
@@ -244,8 +233,6 @@ class DigitClassifier:
         row_left_80 = features["row_left_80"]
         row_width_50 = features["row_width_50"]
         row_width_80 = features["row_width_80"]
-        col_top_50 = features["col_top_50"]
-        col_top_80 = features["col_top_80"]
 
         if digit == 0:
             return (
@@ -265,7 +252,6 @@ class DigitClassifier:
                 + 4.0 * (aspect_ratio < 0.58)
                 + 3.0 * (hr20 <= 1.1 and hr50 <= 1.1 and hr80 <= 1.1)
                 + 2.5 * (vc50 <= 1.2)
-                + 1.0 * (features["vc35"] < 2.0)
                 + 2.0 * (features["center"] > max(left, right) * 1.7)
                 - 2.0 * fill
             )
@@ -320,7 +306,6 @@ class DigitClassifier:
                 + 2.0 * (features["upper_left"] > features["upper_right"])
                 + 2.0 * (row_left_50 < 0.3)
                 + 1.5 * (row_width_80 < 0.5)
-                + 0.5 * (col_top_80 < 0.12)
             )
         if digit == 6:
             return (
@@ -343,7 +328,6 @@ class DigitClassifier:
                 + 2.5 * (hr80 <= 1.1)
                 + 2.0 * (hr65 <= 1.2)
                 + 1.5 * (features["upper_right"] > features["upper_left"])
-                + 1.0 * (col_top_50 < 0.091)
             )
         if digit == 8:
             return (
