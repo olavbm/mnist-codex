@@ -26,15 +26,18 @@ def load_labels(path: Path) -> np.ndarray:
     return labels
 
 
-def binarize(image: np.ndarray) -> np.ndarray:
-    return image >= 48
+# ---------------------------------------------------------------------------
+# Image preprocessing
+# ---------------------------------------------------------------------------
+
+def binarize(image: np.ndarray, threshold: int = 48) -> np.ndarray:
+    return image >= threshold
 
 
 def crop_to_foreground(mask: np.ndarray) -> np.ndarray:
     ys, xs = np.where(mask)
     if ys.size == 0:
         return mask
-
     y0, y1 = ys.min(), ys.max()
     x0, x1 = xs.min(), xs.max()
     pad = 1
@@ -45,68 +48,14 @@ def crop_to_foreground(mask: np.ndarray) -> np.ndarray:
     return mask[y0 : y1 + 1, x0 : x1 + 1]
 
 
-def region_density(mask: np.ndarray, y0: float, y1: float, x0: float, x1: float) -> float:
-    h, w = mask.shape
-    ya = min(h, max(0, int(round(y0 * h))))
-    yb = min(h, max(ya + 1, int(round(y1 * h))))
-    xa = min(w, max(0, int(round(x0 * w))))
-    xb = min(w, max(xa + 1, int(round(x1 * w))))
-    return float(mask[ya:yb, xa:xb].mean())
-
-
-def count_foreground_runs(line: np.ndarray) -> float:
-    runs = 0
-    in_run = False
-    for value in line:
-        if value and not in_run:
-            runs += 1
-            in_run = True
-        elif not value:
-            in_run = False
-    return float(runs)
-
-
-def line_edges(line: np.ndarray) -> tuple[float, float, float]:
-    positions = np.flatnonzero(line)
-    if positions.size == 0:
-        return 0.5, 0.5, 0.0
-    length = float(line.shape[0])
-    return float(positions[0] / length), float(positions[-1] / length), float(positions.size / length)
-
-
-def diagonal_runs(mask: np.ndarray, reverse: bool = False) -> float:
-    h, w = mask.shape
-    line = []
-    for x in range(w):
-        y = min(h - 1, int(round(x * (h - 1) / max(1, w - 1))))
-        sample_x = w - 1 - x if reverse else x
-        line.append(bool(mask[y, sample_x]))
-    return count_foreground_runs(np.array(line, dtype=bool))
-
-
-def close_small_gaps(mask: np.ndarray) -> np.ndarray:
-    closed = mask.copy()
-    h, w = mask.shape
-
-    for y in range(1, h - 1):
-        for x in range(1, w - 1):
-            if mask[y, x]:
-                continue
-            horizontal_gap = mask[y, x - 1] and mask[y, x + 1]
-            vertical_gap = mask[y - 1, x] and mask[y + 1, x]
-            main_diagonal_gap = mask[y - 1, x - 1] and mask[y + 1, x + 1]
-            anti_diagonal_gap = mask[y - 1, x + 1] and mask[y + 1, x - 1]
-            if horizontal_gap or vertical_gap or main_diagonal_gap or anti_diagonal_gap:
-                closed[y, x] = True
-
-    return closed
-
+# ---------------------------------------------------------------------------
+# Topology: connected components and holes
+# ---------------------------------------------------------------------------
 
 def connected_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
     h, w = mask.shape
     seen = np.zeros((h, w), dtype=bool)
     components: list[list[tuple[int, int]]] = []
-
     for y in range(h):
         for x in range(w):
             if not mask[y, x] or seen[y, x]:
@@ -121,8 +70,7 @@ def connected_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
                     for dx in (-1, 0, 1):
                         if dy == 0 and dx == 0:
                             continue
-                        ny = cy + dy
-                        nx = cx + dx
+                        ny, nx = cy + dy, cx + dx
                         if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
                             seen[ny, nx] = True
                             stack.append((ny, nx))
@@ -130,17 +78,31 @@ def connected_components(mask: np.ndarray) -> list[list[tuple[int, int]]]:
     return components
 
 
+def close_small_gaps(mask: np.ndarray) -> np.ndarray:
+    closed = mask.copy()
+    h, w = mask.shape
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            if mask[y, x]:
+                continue
+            if (mask[y, x - 1] and mask[y, x + 1]) or \
+               (mask[y - 1, x] and mask[y + 1, x]) or \
+               (mask[y - 1, x - 1] and mask[y + 1, x + 1]) or \
+               (mask[y - 1, x + 1] and mask[y + 1, x - 1]):
+                closed[y, x] = True
+    return closed
+
+
 def find_holes(mask: np.ndarray) -> list[tuple[float, float, float]]:
+    """Returns list of (relative_area, center_y, center_x) for each hole."""
     padded = np.pad(mask, 1, constant_values=False)
     background = ~padded
     components = connected_components(background)
     holes: list[tuple[float, float, float]] = []
     area = float(mask.shape[0] * mask.shape[1])
-
     for component in components:
         touches_border = False
-        total_y = 0
-        total_x = 0
+        total_y, total_x = 0, 0
         for y, x in component:
             if y == 0 or x == 0 or y == padded.shape[0] - 1 or x == padded.shape[1] - 1:
                 touches_border = True
@@ -154,438 +116,598 @@ def find_holes(mask: np.ndarray) -> list[tuple[float, float, float]]:
     return holes
 
 
-def extract_features(image: np.ndarray) -> dict[str, float]:
+# ---------------------------------------------------------------------------
+# Feature: projection profiles
+# ---------------------------------------------------------------------------
+
+def vertical_profile(mask: np.ndarray) -> np.ndarray:
+    """Sum of foreground pixels per column, normalized to [0,1]."""
+    profile = mask.sum(axis=0).astype(float)
+    mx = profile.max()
+    if mx > 0:
+        profile /= mx
+    return profile
+
+
+def sample_profile(profile: np.ndarray, n: int = 10) -> list[float]:
+    """Resample a profile to n evenly spaced values."""
+    length = len(profile)
+    if length == 0:
+        return [0.0] * n
+    indices = [int(round(i * (length - 1) / (n - 1))) for i in range(n)]
+    return [float(profile[idx]) for idx in indices]
+
+
+# ---------------------------------------------------------------------------
+# Feature: stroke crossings
+# ---------------------------------------------------------------------------
+
+def count_crossings(line: np.ndarray) -> int:
+    """Count foreground-to-background transitions (number of runs)."""
+    runs = 0
+    in_fg = False
+    for v in line:
+        if v and not in_fg:
+            runs += 1
+            in_fg = True
+        elif not v:
+            in_fg = False
+    return runs
+
+
+def horizontal_crossings(mask: np.ndarray, fractions: list[float]) -> list[int]:
+    """Count stroke crossings at given row fractions."""
+    h = mask.shape[0]
+    result = []
+    for f in fractions:
+        y = min(h - 1, int(round(f * (h - 1))))
+        result.append(count_crossings(mask[y, :]))
+    return result
+
+
+def vertical_crossings(mask: np.ndarray, fractions: list[float]) -> list[int]:
+    """Count stroke crossings at given column fractions."""
+    w = mask.shape[1]
+    result = []
+    for f in fractions:
+        x = min(w - 1, int(round(f * (w - 1))))
+        result.append(count_crossings(mask[:, x]))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Feature: grid densities (3x3)
+# ---------------------------------------------------------------------------
+
+def region_density(mask: np.ndarray, y0: float, y1: float, x0: float, x1: float) -> float:
+    h, w = mask.shape
+    ya = min(h, max(0, int(round(y0 * h))))
+    yb = min(h, max(ya + 1, int(round(y1 * h))))
+    xa = min(w, max(0, int(round(x0 * w))))
+    xb = min(w, max(xa + 1, int(round(x1 * w))))
+    return float(mask[ya:yb, xa:xb].mean())
+
+
+# ---------------------------------------------------------------------------
+# Feature: symmetry
+# ---------------------------------------------------------------------------
+
+def vertical_symmetry(mask: np.ndarray) -> float:
+    return 1.0 - float(np.logical_xor(mask, np.fliplr(mask)).mean())
+
+
+def horizontal_symmetry(mask: np.ndarray) -> float:
+    return 1.0 - float(np.logical_xor(mask, np.flipud(mask)).mean())
+
+
+# ---------------------------------------------------------------------------
+# Feature: stroke width and position
+# ---------------------------------------------------------------------------
+
+def row_span(line: np.ndarray) -> tuple[float, float, float]:
+    """Return (left_start, right_end, width) normalized to [0,1]."""
+    positions = np.flatnonzero(line)
+    if positions.size == 0:
+        return 0.5, 0.5, 0.0
+    n = float(line.shape[0])
+    return float(positions[0] / n), float(positions[-1] / n), float(positions.size / n)
+
+
+def col_span(line: np.ndarray) -> tuple[float, float, float]:
+    """Return (top_start, bottom_end, height) normalized to [0,1]."""
+    return row_span(line)
+
+
+# ---------------------------------------------------------------------------
+# Feature: diagonal analysis
+# ---------------------------------------------------------------------------
+
+def diagonal_crossings(mask: np.ndarray, reverse: bool = False) -> int:
+    h, w = mask.shape
+    line = []
+    for x in range(w):
+        y = min(h - 1, int(round(x * (h - 1) / max(1, w - 1))))
+        sx = w - 1 - x if reverse else x
+        line.append(bool(mask[y, sx]))
+    return count_crossings(np.array(line, dtype=bool))
+
+
+# ---------------------------------------------------------------------------
+# All features bundled
+# ---------------------------------------------------------------------------
+
+def extract_features(image: np.ndarray) -> dict:
     mask = crop_to_foreground(binarize(image))
     h, w = mask.shape
-    row_levels = (20, 35, 50, 65, 80)
-    col_levels = (20, 35, 50, 65, 80)
-    span_levels = (20, 50, 80)
-    if not mask.any():
-        return {
-            "aspect_ratio": 1.0,
-            "fill": 0.0,
-            "center_y": 0.5,
-            "center_x": 0.5,
-            "holes": 0.0,
-            "repaired_holes": 0.0,
-            "largest_hole": 0.0,
-            "repaired_largest_hole": 0.0,
-            "hole_y": 0.5,
-            "hole_x": 0.5,
-            "top": 0.0,
-            "middle": 0.0,
-            "bottom": 0.0,
-            "left": 0.0,
-            "center": 0.0,
-            "right": 0.0,
-            "upper_left": 0.0,
-            "upper_right": 0.0,
-            "lower_left": 0.0,
-            "lower_right": 0.0,
-            "vertical_symmetry": 0.0,
-            "horizontal_symmetry": 0.0,
-            "hr20": 0.0,
-            "hr35": 0.0,
-            "hr50": 0.0,
-            "hr65": 0.0,
-            "hr80": 0.0,
-            "vc20": 0.0,
-            "vc35": 0.0,
-            "vc50": 0.0,
-            "vc65": 0.0,
-            "vc80": 0.0,
-            "row_left_20": 0.5,
-            "row_left_50": 0.5,
-            "row_left_80": 0.5,
-            "row_width_20": 0.0,
-            "row_width_50": 0.0,
-            "row_width_80": 0.0,
-            "col_top_20": 0.5,
-            "col_top_50": 0.5,
-            "col_top_80": 0.5,
-            "col_height_20": 0.0,
-            "col_height_50": 0.0,
-            "col_height_80": 0.0,
-            "main_diag_runs": 0.0,
-            "anti_diag_runs": 0.0,
-        }
 
+    if not mask.any():
+        return {"empty": True}
+
+    # Basic geometry
     ys, xs = np.where(mask)
+    aspect = w / h
+    fill = float(mask.mean())
+    center_y = float(ys.mean() / h)
+    center_x = float(xs.mean() / w)
+
+    # Holes
     holes = find_holes(mask)
-    repaired_holes = find_holes(close_small_gaps(mask))
-    features = {
-        "aspect_ratio": w / h,
-        "fill": float(mask.mean()),
-        "center_y": float(ys.mean() / h),
-        "center_x": float(xs.mean() / w),
-        "holes": float(len(holes)),
-        "repaired_holes": float(len(repaired_holes)),
-        "largest_hole": float(max((hole[0] for hole in holes), default=0.0)),
-        "repaired_largest_hole": float(max((hole[0] for hole in repaired_holes), default=0.0)),
-        "hole_y": float(sum(hole[1] for hole in holes) / len(holes)) if holes else 0.5,
-        "hole_x": float(sum(hole[2] for hole in holes) / len(holes)) if holes else 0.5,
-        "top": region_density(mask, 0.0, 0.33, 0.0, 1.0),
-        "middle": region_density(mask, 0.33, 0.66, 0.0, 1.0),
-        "bottom": region_density(mask, 0.66, 1.0, 0.0, 1.0),
-        "left": region_density(mask, 0.0, 1.0, 0.0, 0.33),
-        "center": region_density(mask, 0.0, 1.0, 0.33, 0.66),
-        "right": region_density(mask, 0.0, 1.0, 0.66, 1.0),
-        "upper_left": region_density(mask, 0.0, 0.5, 0.0, 0.5),
-        "upper_right": region_density(mask, 0.0, 0.5, 0.5, 1.0),
-        "lower_left": region_density(mask, 0.5, 1.0, 0.0, 0.5),
-        "lower_right": region_density(mask, 0.5, 1.0, 0.5, 1.0),
-        "vertical_symmetry": 1.0 - float(np.logical_xor(mask, np.fliplr(mask)).mean()),
-        "horizontal_symmetry": 1.0 - float(np.logical_xor(mask, np.flipud(mask)).mean()),
+    repaired_mask = close_small_gaps(mask)
+    repaired_holes = find_holes(repaired_mask)
+    n_holes = len(holes)
+    n_repaired_holes = len(repaired_holes)
+    largest_hole = max((ho[0] for ho in holes), default=0.0)
+    repaired_largest = max((ho[0] for ho in repaired_holes), default=0.0)
+    hole_cy = sum(ho[1] for ho in holes) / n_holes if n_holes else 0.5
+    hole_cx = sum(ho[2] for ho in holes) / n_holes if n_holes else 0.5
+
+    # Region densities (original thirds)
+    top = region_density(mask, 0.0, 0.33, 0.0, 1.0)
+    middle = region_density(mask, 0.33, 0.66, 0.0, 1.0)
+    bottom = region_density(mask, 0.66, 1.0, 0.0, 1.0)
+    left = region_density(mask, 0.0, 1.0, 0.0, 0.33)
+    right = region_density(mask, 0.0, 1.0, 0.66, 1.0)
+    center = region_density(mask, 0.0, 1.0, 0.33, 0.66)
+    ul = region_density(mask, 0.0, 0.5, 0.0, 0.5)
+    ur = region_density(mask, 0.0, 0.5, 0.5, 1.0)
+    ll = region_density(mask, 0.5, 1.0, 0.0, 0.5)
+    lr = region_density(mask, 0.5, 1.0, 0.5, 1.0)
+
+    # Stroke crossings at multiple scan lines
+    hc = horizontal_crossings(mask, [0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9])
+    vc = vertical_crossings(mask, [0.2, 0.35, 0.5, 0.65, 0.8])
+
+    # Row/col spans at key positions
+    rs10 = row_span(mask[min(h - 1, int(round(0.1 * (h - 1)))), :])
+    rs20 = row_span(mask[min(h - 1, int(round(0.2 * (h - 1)))), :])
+    rs50 = row_span(mask[min(h - 1, int(round(0.5 * (h - 1)))), :])
+    rs80 = row_span(mask[min(h - 1, int(round(0.8 * (h - 1)))), :])
+    rs90 = row_span(mask[min(h - 1, int(round(0.9 * (h - 1)))), :])
+    cs50 = col_span(mask[:, min(w - 1, int(round(0.5 * (w - 1))))])
+    cs80 = col_span(mask[:, min(w - 1, int(round(0.8 * (w - 1))))])
+
+    # Symmetry
+    vsym = vertical_symmetry(mask)
+    hsym = horizontal_symmetry(mask)
+
+    # Diagonals
+    main_diag = diagonal_crossings(mask, reverse=False)
+    anti_diag = diagonal_crossings(mask, reverse=True)
+
+    # Projection profiles (sampled to 10 points)
+    vprof = sample_profile(vertical_profile(mask), 10)
+
+    return {
+        "aspect": aspect,
+        "fill": fill,
+        "cy": center_y,
+        "cx": center_x,
+        "n_holes": n_holes,
+        "n_rh": n_repaired_holes,
+        "largest_hole": largest_hole,
+        "rep_largest": repaired_largest,
+        "hole_cy": hole_cy,
+        "hole_cx": hole_cx,
+        # region densities
+        "top": top, "middle": middle, "bottom": bottom,
+        "left": left, "right": right, "center": center,
+        "ul": ul, "ur": ur, "ll": ll, "lr": lr,
+        # horizontal crossings
+        "hc10": hc[0], "hc20": hc[1], "hc35": hc[2], "hc50": hc[3], "hc65": hc[4], "hc80": hc[5], "hc90": hc[6],
+        # vertical crossings
+        "vc20": vc[0], "vc35": vc[1], "vc50": vc[2], "vc65": vc[3], "vc80": vc[4],
+        # row spans
+        "rs10_left": rs10[0], "rs10_w": rs10[2],
+        "rs20_left": rs20[0], "rs20_w": rs20[2],
+        "rs50_left": rs50[0], "rs50_w": rs50[2],
+        "rs80_left": rs80[0], "rs80_w": rs80[2],
+        "rs90_left": rs90[0], "rs90_w": rs90[2],
+        # col spans
+        "cs50_top": cs50[0], "cs50_h": cs50[2],
+        "cs80_top": cs80[0], "cs80_h": cs80[2],
+        # symmetry
+        "vsym": vsym,
+        "hsym": hsym,
+        # diagonals
+        "main_diag": main_diag,
+        "anti_diag": anti_diag,
+        # profile
+        "vp": vprof,
     }
-    for level in row_levels:
-        y = int(round((level / 100.0) * (h - 1)))
-        features[f"hr{level}"] = count_foreground_runs(mask[y, :])
-    for level in col_levels:
-        x = int(round((level / 100.0) * (w - 1)))
-        features[f"vc{level}"] = count_foreground_runs(mask[:, x])
-    for level in span_levels:
-        y = int(round((level / 100.0) * (h - 1)))
-        row_left, _, row_width = line_edges(mask[y, :])
-        features[f"row_left_{level}"] = row_left
-        features[f"row_width_{level}"] = row_width
-    for level in span_levels:
-        x = int(round((level / 100.0) * (w - 1)))
-        col_top, _, col_height = line_edges(mask[:, x])
-        features[f"col_top_{level}"] = col_top
-        features[f"col_height_{level}"] = col_height
-    features["main_diag_runs"] = diagonal_runs(mask)
-    features["anti_diag_runs"] = diagonal_runs(mask, reverse=True)
-    return features
+
+
+# ---------------------------------------------------------------------------
+# Per-digit detectors
+# ---------------------------------------------------------------------------
+
+def detect_one(f: dict) -> float:
+    """Digit 1: narrow, single stroke, no holes."""
+    score = 0.0
+    score += 8.0 * (f["n_holes"] == 0)
+    score += 4.0 * (f["aspect"] < 0.58)
+    score += 3.0 * (f["hc20"] <= 1 and f["hc50"] <= 1 and f["hc80"] <= 1)
+    score += 2.5 * (f["vc50"] <= 1)
+    score += 1.0 * (f["vc35"] < 2)
+    score += 2.0 * (f["center"] > max(f["left"], f["right"]) * 1.7)
+    score += 1.0 * (f["aspect"] < 0.52)
+    score += 1.0 * (f["center"] > max(f["left"], f["right"]) * 2.0)
+    # vertical profile: 1 has a narrow spike — most columns are empty
+    vp = f["vp"]
+    low_cols = sum(1 for v in vp if v < 0.3)
+    score += 1.5 * (low_cols >= 5)
+    score -= 2.0 * f["fill"]
+    score -= 1.0 * (f["vc50"] > 1)
+    return score
+
+
+def detect_zero(f: dict) -> float:
+    """Digit 0: one hole, vertically symmetric, oval shape."""
+    score = 0.0
+    repaired_loop = f["n_rh"] == 1 and f["rep_largest"] > 0.08
+    broken_loop = f["n_holes"] == 0 and repaired_loop
+    balanced = abs(f["left"] - f["right"]) < 0.1 and abs(f["top"] - f["bottom"]) < 0.1 and f["rs80_w"] > 0.42
+
+    score += 8.0 * (f["n_holes"] == 1)
+    score += 4.0 * broken_loop
+    score += 1.0 * balanced
+    score += 3.5 * f["vsym"]
+    score += 2.5 * (f["hc50"] == 2)
+    score += 2.0 * (f["vc50"] == 2)
+    score += 1.5 * (f["largest_hole"] > 0.1)
+    score += 2.0 * (0.42 <= f["hole_cy"] <= 0.6)
+    score += 1.5 * (abs(f["top"] - f["bottom"]) < 0.12)
+    score += 1.0 * (0.28 <= f["rs50_w"] <= 0.5)
+    score -= 2.5 * (f["hole_cy"] > 0.62)
+    score -= 2.5 * (f["hole_cy"] < 0.4)
+    score -= 2.0 * (f["n_holes"] >= 2)
+    return score
+
+
+def detect_two(f: dict) -> float:
+    """Digit 2: no holes, top-right curve sweeps to bottom-left base."""
+    score = 0.0
+    sweeping = f["rs50_left"] > 0.42 and f["rs50_w"] < 0.32 and f["rs80_w"] > 0.5
+
+    score += 6.0 * (f["n_holes"] == 0 or f["largest_hole"] < 0.03)
+    score += 2.5 * (f["top"] > f["middle"] * 1.02)
+    score += 3.0 * (f["bottom"] > f["middle"] * 1.15)
+    score += 2.5 * (f["ll"] > f["lr"] * 1.05)
+    score += 2.0 * (f["hc50"] <= 1)
+    score += 1.5 * (f["vc50"] >= 2)
+    score += 1.5 * (f["rs50_left"] > 0.4)
+    score += 1.5 * (f["rs80_w"] > 0.5)
+    score += 1.5 * (f["rs20_left"] < 0.38)
+    score += 2.0 * sweeping
+    score += 1.5 * (f["main_diag"] >= f["anti_diag"] + 0.2)
+    score -= 1.5 * (f["rs50_left"] < 0.3)
+    score -= 2.0 * (f["n_holes"] == 0)
+    score -= 1.5 * (f["rs50_w"] > 0.38)
+    return score
+
+
+def detect_three(f: dict) -> float:
+    """Digit 3: no holes, right-heavy, two bumps at top and bottom."""
+    score = 0.0
+    score += 6.0 * (f["n_holes"] == 0)
+    score += 3.0 * (f["right"] > f["left"] * 1.35)
+    score += 2.0 * (f["top"] > 0.22)
+    score += 2.0 * (f["bottom"] > 0.22)
+    score += 2.0 * (f["hc20"] <= 1 and f["hc80"] <= 1)
+    score += 1.5 * (f["vc50"] >= 3)
+    score += 2.0 * (f["vc50"] >= 3)
+    score += 2.0 * (f["rs50_w"] > 0.35)
+    score += 1.5 * (f["rs80_left"] > 0.16)
+    score -= 2.0 * (f["rs50_left"] < 0.24)
+    score -= 2.0 * (f["left"] > f["right"] * 0.95)
+    score -= 1.5 * (f["ll"] > f["lr"] * 1.1)
+    return score
+
+
+def detect_four(f: dict) -> float:
+    """Digit 4: open top, dense middle crossbar, narrow bottom."""
+    score = 0.0
+    score += 6.0 * (f["n_holes"] <= 1)
+    score += 3.0 * (f["middle"] > f["top"] * 1.45)
+    score += 3.0 * (f["middle"] > f["bottom"] * 2.0)
+    score += 2.5 * (f["hc20"] >= 2)
+    score += 2.5 * (f["hc35"] >= 2)
+    score += 2.0 * (f["hc80"] <= 1)
+    score += 1.5 * (f["right"] >= f["left"] * 0.9)
+    score += 1.0 * (f["vc50"] <= 1)
+    score += 1.0 * (f["middle"] > f["bottom"] * 2.2)
+    score -= 2.0 * _broken_loop_nine(f)
+    score -= 0.5 * (f["cs50_top"] < 0.14)
+    return score
+
+
+def detect_five(f: dict) -> float:
+    """Digit 5: left-heavy, top bar, lower-right bowl."""
+    score = 0.0
+    broken_loop_zero = f["n_holes"] == 0 and f["n_rh"] == 1 and f["rep_largest"] > 0.08
+
+    score += 6.0 * (f["n_holes"] == 0)
+    score += 3.0 * (f["left"] > f["right"] * 1.15)
+    score += 2.0 * (f["top"] > f["middle"] * 1.02)
+    score += 2.0 * (f["bottom"] > f["middle"] * 0.95)
+    score += 2.0 * (f["lr"] > f["ll"] * 0.75)
+    score += 1.5 * (f["vc50"] >= 3)
+    score += 2.0 * (f["ul"] > f["ur"])
+    score += 2.0 * (f["rs50_left"] < 0.3)
+    score += 1.5 * (f["rs80_w"] < 0.5)
+    score += 0.5 * (f["cs80_top"] < 0.12)
+    score += 1.0 * (f["left"] > f["right"] * 1.2)
+    score += 1.5 * (f["anti_diag"] >= f["main_diag"] + 0.5)
+    score -= 2.0 * broken_loop_zero
+    score -= 1.0 * (f["bottom"] > f["top"] * 1.2)
+    score -= 1.0 * (f["main_diag"] >= f["anti_diag"] + 0.4)
+    score -= 1.0 * (f["rs50_left"] > 0.32)
+    score -= 1.5 * (f["main_diag"] > f["anti_diag"] + 0.2)
+    return score
+
+
+def detect_six(f: dict) -> float:
+    """Digit 6: bottom-heavy, one hole in lower half."""
+    score = 0.0
+    diag_balance = f["main_diag"] - f["anti_diag"]
+    broken_loop = (
+        f["n_holes"] == 0 and f["n_rh"] == 1
+        and f["rep_largest"] > 0.02
+        and f["bottom"] > f["top"] * 1.25
+        and f["hc80"] >= 2
+    )
+
+    score += 8.0 * (f["n_holes"] == 1)
+    score += 3.0 * broken_loop
+    score += 3.5 * (
+        f["n_holes"] == 0
+        and f["top"] < 0.25
+        and f["bottom"] > f["middle"] * 1.1
+        and f["cs50_top"] > 0.14
+        and diag_balance > 0.45
+    )
+    score += 3.5 * (f["hole_cy"] > 0.56)
+    score += 2.5 * (f["bottom"] > f["top"] * 1.35)
+    score += 2.0 * (f["left"] >= f["right"] * 1.05)
+    score += 2.0 * (f["hc65"] >= 2)
+    score += 1.5 * (f["hc20"] <= 1)
+    score += 1.5 * (f["largest_hole"] > 0.015)
+    score += 1.0 * (f["cs50_top"] > 0.12)
+    score += 1.0 * (f["middle"] > f["top"] * 1.35)
+    score += 1.0 * (diag_balance > 0.6)
+    score += 2.5 * (f["main_diag"] > f["anti_diag"] + 0.35)
+    score += 1.0 * (f["rs50_left"] < 0.18)
+    score += 0.75 * (f["bottom"] > f["top"] * 1.6)
+    score -= 2.5 * (f["top"] > 0.26)
+    score -= 2.0 * (f["rs50_left"] > 0.28)
+    score -= 2.5 * (f["anti_diag"] > f["main_diag"] + 0.2)
+    score -= 1.5 * (diag_balance < 0.2)
+    return score
+
+
+def detect_seven(f: dict) -> float:
+    """Digit 7: top bar, diagonal stroke downward, no holes."""
+    score = 0.0
+    score += 6.0 * (f["n_holes"] == 0)
+    score += 3.0 * (f["top"] > f["middle"] * 1.3)
+    score += 3.0 * (f["top"] > f["bottom"] * 1.7)
+    score += 2.5 * (f["hc80"] <= 1)
+    score += 2.0 * (f["hc65"] <= 1)
+    score += 1.5 * (f["ur"] > f["ul"])
+    score += 1.0 * (f["cs50_top"] < 0.091)
+    score += 1.0 * (f["rs80_w"] < 0.24)
+    score += 1.0 * (f["bottom"] < f["top"] * 0.75)
+    score -= 2.0 * (f["rs50_w"] > 0.42)
+    score -= 1.5 * (f["vc50"] > 2)
+    score -= 1.5 * (f["n_rh"] > 0)
+    score -= 1.0 * (f["cs50_top"] > 0.12)
+    return score
+
+
+def detect_eight(f: dict) -> float:
+    """Digit 8: two holes, symmetric, pinched middle."""
+    score = 0.0
+    score += 9.0 * (f["n_holes"] >= 2)
+    score += 5.0 * (f["n_holes"] == 1)
+    score += 3.0 * (f["n_rh"] >= 2)
+    score += 1.5 * (f["n_holes"] == 1 and f["left"] >= f["right"] * 1.05 and f["hc50"] <= 1)
+    score += 1.5 * (f["n_holes"] == 1 and f["n_rh"] >= 2)
+    score += 2.0 * f["vsym"]
+    score += 2.0 * f["hsym"]
+    score += 2.0 * (f["hc20"] >= 2)
+    score += 2.0 * (f["hc80"] >= 2)
+    score += 1.5 * (f["vc50"] >= 3)
+    score += 1.5 * (f["largest_hole"] > 0.025)
+    score += 1.5 * (0.35 <= f["hole_cy"] <= 0.65)
+    score += 1.5 * (f["rs80_w"] < 0.52)
+    score += 1.5 * (f["ll"] > f["lr"] * 1.08)
+    score -= 1.5 * (f["n_holes"] == 1 and f["largest_hole"] > 0.1)
+    return score
+
+
+def detect_nine(f: dict) -> float:
+    """Digit 9: one hole in upper half, top-heavy."""
+    score = 0.0
+    score += 8.0 * (f["n_holes"] == 1)
+    score += 3.5 * _broken_loop_nine(f)
+    score += 3.0 * _slashed_nine(f)
+    score += 3.5 * (f["hole_cy"] < 0.42)
+    score += 2.5 * (f["top"] > f["bottom"] * 1.35)
+    score += 2.0 * (f["right"] >= f["left"] * 1.05)
+    score += 2.0 * (f["hc20"] >= 2)
+    score += 1.5 * (f["hc80"] <= 1)
+    score += 1.5 * (f["rs80_left"] > 0.35)
+    score += 1.5 * (f["rs80_w"] < 0.32)
+    score += 1.0 * (f["largest_hole"] > 0.03)
+    score += 1.5 * (f["rs50_w"] > 0.4)
+    score += 1.5 * (f["n_rh"] > 0)
+    score += 0.5 * (f["cs50_top"] < 0.11)
+    score -= 1.0 * (f["vc50"] <= 1)
+    score -= 1.0 * (f["cs50_top"] > 0.18)
+    return score
+
+
+# Helper conditions used across detectors
+def _broken_loop_nine(f: dict) -> bool:
+    return (
+        f["n_holes"] == 0
+        and f["n_rh"] == 1
+        and f["rep_largest"] > 0.03
+        and f["top"] > f["bottom"] * 1.3
+        and f["rs80_left"] > 0.35
+        and f["rs80_w"] < 0.28
+    )
+
+
+def _slashed_nine(f: dict) -> bool:
+    return (
+        f["n_holes"] == 0
+        and f["top"] > f["bottom"] * 1.45
+        and f["rs50_left"] > 0.45
+        and f["rs50_w"] < 0.24
+        and f["vc50"] >= 2
+    )
+
+
+# ---------------------------------------------------------------------------
+# Classifier
+# ---------------------------------------------------------------------------
+
+DETECTORS = [
+    detect_zero,
+    detect_one,
+    detect_two,
+    detect_three,
+    detect_four,
+    detect_five,
+    detect_six,
+    detect_seven,
+    detect_eight,
+    detect_nine,
+]
 
 
 class DigitClassifier:
-    def score_digit(self, features: dict[str, float], digit: int) -> float:
-        holes = features["holes"]
-        repaired_holes = features["repaired_holes"]
-        largest_hole = features["largest_hole"]
-        repaired_largest_hole = features["repaired_largest_hole"]
-        top = features["top"]
-        middle = features["middle"]
-        bottom = features["bottom"]
-        left = features["left"]
-        right = features["right"]
-        aspect_ratio = features["aspect_ratio"]
-        hole_y = features["hole_y"]
-        fill = features["fill"]
-        hr20 = features["hr20"]
-        hr35 = features["hr35"]
-        hr50 = features["hr50"]
-        hr65 = features["hr65"]
-        hr80 = features["hr80"]
-        vc50 = features["vc50"]
-        row_left_20 = features["row_left_20"]
-        row_left_50 = features["row_left_50"]
-        row_left_80 = features["row_left_80"]
-        row_width_50 = features["row_width_50"]
-        row_width_80 = features["row_width_80"]
-        col_top_50 = features["col_top_50"]
-        col_top_80 = features["col_top_80"]
-        main_diag_runs = features["main_diag_runs"]
-        anti_diag_runs = features["anti_diag_runs"]
-        diag_balance = main_diag_runs - anti_diag_runs
-        sweeping_two = row_left_50 > 0.42 and row_width_50 < 0.32 and row_width_80 > 0.5
-        repaired_loop = repaired_holes == 1.0 and repaired_largest_hole > 0.08
-        broken_loop_zero = holes == 0.0 and repaired_loop
-        balanced_zero = abs(left - right) < 0.1 and abs(top - bottom) < 0.1 and row_width_80 > 0.42
-        broken_loop_nine = (
-            holes == 0.0
-            and repaired_holes == 1.0
-            and repaired_largest_hole > 0.03
-            and top > bottom * 1.3
-            and row_left_80 > 0.35
-            and row_width_80 < 0.28
-        )
-        broken_loop_six = (
-            holes == 0.0
-            and repaired_holes == 1.0
-            and repaired_largest_hole > 0.02
-            and bottom > top * 1.25
-            and hr80 >= 1.8
-        )
-        slashed_nine = (
-            holes == 0.0
-            and top > bottom * 1.45
-            and row_left_50 > 0.45
-            and row_width_50 < 0.24
-            and vc50 >= 2.0
-        )
-        if digit == 0:
-            return (
-                8.0 * (holes == 1.0)
-                + 4.0 * broken_loop_zero
-                + 1.0 * balanced_zero
-                + 3.5 * features["vertical_symmetry"]
-                + 2.5 * (1.6 <= hr50 <= 2.4)
-                + 2.0 * (1.6 <= vc50 <= 2.4)
-                + 1.5 * (largest_hole > 0.1)
-                + 2.0 * (0.42 <= hole_y <= 0.6)
-                + 1.5 * (abs(top - bottom) < 0.12)
-                + 1.0 * (0.28 <= row_width_50 <= 0.5)
-                - 2.5 * (hole_y > 0.62)
-                - 2.5 * (hole_y < 0.4)
-                - 2.0 * (holes >= 2.0)
-            )
-        if digit == 1:
-            return (
-                8.0 * (holes == 0.0)
-                + 4.0 * (aspect_ratio < 0.58)
-                + 3.0 * (hr20 <= 1.1 and hr50 <= 1.1 and hr80 <= 1.1)
-                + 2.5 * (vc50 <= 1.2)
-                + 1.0 * (features["vc35"] < 2.0)
-                + 2.0 * (features["center"] > max(left, right) * 1.7)
-                + 1.0 * (aspect_ratio < 0.52)
-                + 1.0 * (features["center"] > max(left, right) * 2.0)
-                - 2.0 * fill
-                - 1.0 * (vc50 > 1.5)
-            )
-        if digit == 2:
-            return (
-                6.0 * (holes == 0.0 or largest_hole < 0.03)
-                + 2.5 * (top > middle * 1.02)
-                + 3.0 * (bottom > middle * 1.15)
-                + 2.5 * (features["lower_left"] > features["lower_right"] * 1.05)
-                + 2.0 * (hr50 <= 1.2)
-                + 1.5 * (vc50 >= 1.8)
-                + 1.5 * (row_left_50 > 0.4)
-                + 1.5 * (row_width_80 > 0.5)
-                + 1.5 * (row_left_20 < 0.38)
-                + 2.0 * sweeping_two
-                + 1.5 * (main_diag_runs >= anti_diag_runs + 0.2)
-                - 1.5 * (row_left_50 < 0.3)
-                - 2.0 * (holes == 0.0)
-                - 1.5 * (row_width_50 > 0.38)
-            )
-        if digit == 3:
-            return (
-                6.0 * (holes == 0.0)
-                + 3.0 * (right > left * 1.35)
-                + 2.0 * (top > 0.22)
-                + 2.0 * (bottom > 0.22)
-                + 2.0 * (hr20 <= 1.6 and hr80 <= 1.6)
-                + 1.5 * (vc50 >= 2.3)
-                + 2.0 * (vc50 >= 2.5)
-                + 2.0 * (row_width_50 > 0.35)
-                + 1.5 * (row_left_80 > 0.16)
-                - 2.0 * (row_left_50 < 0.24)
-                - 2.0 * (left > right * 0.95)
-                - 1.5 * (features["lower_left"] > features["lower_right"] * 1.1)
-            )
-        if digit == 4:
-            return (
-                6.0 * (holes <= 1.0)
-                + 3.0 * (middle > top * 1.45)
-                + 3.0 * (middle > bottom * 2.0)
-                + 2.5 * (hr20 >= 1.6)
-                + 2.5 * (hr35 >= 1.7)
-                + 2.0 * (hr80 <= 1.2)
-                + 1.5 * (right >= left * 0.9)
-                + 1.0 * (vc50 <= 1.4)
-                + 1.0 * (middle > bottom * 2.2)
-                - 2.0 * broken_loop_nine
-                - 0.5 * (col_top_50 < 0.14)
-            )
-        if digit == 5:
-            return (
-                6.0 * (holes == 0.0)
-                + 3.0 * (left > right * 1.15)
-                + 2.0 * (top > middle * 1.02)
-                + 2.0 * (bottom > middle * 0.95)
-                + 2.0 * (features["lower_right"] > features["lower_left"] * 0.75)
-                + 1.5 * (vc50 >= 2.2)
-                + 2.0 * (features["upper_left"] > features["upper_right"])
-                + 2.0 * (row_left_50 < 0.3)
-                + 1.5 * (row_width_80 < 0.5)
-                + 0.5 * (col_top_80 < 0.12)
-                + 1.0 * (left > right * 1.2)
-                + 1.5 * (anti_diag_runs >= main_diag_runs + 0.5)
-                - 2.0 * broken_loop_zero
-                - 1.0 * (bottom > top * 1.2)
-                - 1.0 * (main_diag_runs >= anti_diag_runs + 0.4)
-                - 1.0 * (row_left_50 > 0.32)
-                - 1.5 * (main_diag_runs > anti_diag_runs + 0.2)
-            )
-        if digit == 6:
-            return (
-                8.0 * (holes == 1.0)
-                + 3.0 * broken_loop_six
-                + 3.5
-                * (
-                    holes == 0.0
-                    and top < 0.25
-                    and bottom > middle * 1.1
-                    and col_top_50 > 0.14
-                    and diag_balance > 0.45
-                )
-                + 3.5 * (hole_y > 0.56)
-                + 2.5 * (bottom > top * 1.35)
-                + 2.0 * (left >= right * 1.05)
-                + 2.0 * (hr65 >= 1.6)
-                + 1.5 * (hr20 <= 1.2)
-                + 1.5 * (largest_hole > 0.015)
-                + 1.0 * (col_top_50 > 0.12)
-                + 1.0 * (middle > top * 1.35)
-                + 1.0 * (diag_balance > 0.6)
-                + 2.5 * (main_diag_runs > anti_diag_runs + 0.35)
-                + 1.0 * (row_left_50 < 0.18)
-                + 0.75 * (bottom > top * 1.6)
-                - 2.5 * (top > 0.26)
-                - 2.0 * (row_left_50 > 0.28)
-                - 2.5 * (anti_diag_runs > main_diag_runs + 0.2)
-                - 1.5 * (diag_balance < 0.2)
-            )
-        if digit == 7:
-            return (
-                6.0 * (holes == 0.0)
-                + 3.0 * (top > middle * 1.3)
-                + 3.0 * (top > bottom * 1.7)
-                + 2.5 * (hr80 <= 1.1)
-                + 2.0 * (hr65 <= 1.2)
-                + 1.5 * (features["upper_right"] > features["upper_left"])
-                + 1.0 * (col_top_50 < 0.091)
-                + 1.0 * (row_width_80 < 0.24)
-                + 1.0 * (bottom < top * 0.75)
-                - 2.0 * (row_width_50 > 0.42)
-                - 1.5 * (vc50 > 2.15)
-                - 1.5 * (repaired_holes > 0.45)
-                - 1.0 * (col_top_50 > 0.12)
-            )
-        if digit == 8:
-            return (
-                9.0 * (holes >= 2.0)
-                + 5.0 * (holes == 1.0)
-                + 3.0 * (repaired_holes >= 2.0)
-                + 1.5 * (holes == 1.0 and left >= right * 1.05 and hr50 <= 1.2)
-                + 1.5 * (holes == 1.0 and repaired_holes >= 2.0)
-                + 2.0 * features["vertical_symmetry"]
-                + 2.0 * features["horizontal_symmetry"]
-                + 2.0 * (hr20 >= 1.5)
-                + 2.0 * (hr80 >= 1.5)
-                + 1.5 * (vc50 >= 2.2)
-                + 1.5 * (largest_hole > 0.025)
-                + 1.5 * (0.35 <= hole_y <= 0.65)
-                + 1.5 * (row_width_80 < 0.52)
-                + 1.5 * (features["lower_left"] > features["lower_right"] * 1.08)
-                - 1.5 * (holes == 1.0 and largest_hole > 0.1)
-            )
-        if digit == 9:
-            return (
-                8.0 * (holes == 1.0)
-                + 3.5 * broken_loop_nine
-                + 3.0 * slashed_nine
-                + 3.5 * (hole_y < 0.42)
-                + 2.5 * (top > bottom * 1.35)
-                + 2.0 * (right >= left * 1.05)
-                + 2.0 * (hr20 >= 1.6)
-                + 1.5 * (hr80 <= 1.2)
-                + 1.5 * (row_left_80 > 0.35)
-                + 1.5 * (row_width_80 < 0.32)
-                + 1.0 * (largest_hole > 0.03)
-                + 1.5 * (row_width_50 > 0.4)
-                + 1.5 * (repaired_holes > 0.45)
-                + 0.5 * (col_top_50 < 0.11)
-                - 1.0 * (vc50 <= 1.6)
-                - 1.0 * (col_top_50 > 0.18)
-            )
-        raise ValueError(f"Unexpected digit: {digit}")
-
     def classify(self, image: np.ndarray) -> int:
         features = extract_features(image)
-        scores = [self.score_digit(features, digit) for digit in range(10)]
-        order = sorted(range(10), key=lambda digit: scores[digit], reverse=True)
-        best_digit = order[0]
-        second_digit = order[1]
-        return self.break_tie(features, scores, best_digit, second_digit)
+        if features.get("empty"):
+            return 0
 
-    def break_tie(
-        self,
-        features: dict[str, float],
-        scores: list[float],
-        best_digit: int,
-        second_digit: int,
-    ) -> int:
-        pair = {best_digit, second_digit}
-        if pair == {3, 5} and abs(scores[3] - scores[5]) <= 2.0:
-            if (
-                features["upper_left"] > features["upper_right"] * 1.08
-                and features["row_left_50"] < 0.24
-            ):
+        scores = [det(features) for det in DETECTORS]
+
+        # Sort by score descending
+        order = sorted(range(10), key=lambda d: scores[d], reverse=True)
+        best = order[0]
+        second = order[1]
+        third = order[2]
+
+        result = self.break_tie(features, scores, best, second)
+
+        # Second pass: if result is close to third candidate, check again
+        # Check third candidate
+        if abs(scores[result] - scores[third]) <= 3.5:
+            alt = self.break_tie(features, scores, result, third)
+            if alt != result:
+                result = alt
+
+        return result
+
+    def break_tie(self, f: dict, scores: list[float], best: int, second: int) -> int:
+        pair = {best, second}
+        gap = abs(scores[best] - scores[second])
+
+        if pair == {3, 5} and gap <= 2.0:
+            if f["ul"] > f["ur"] * 1.08 and f["rs50_left"] < 0.24:
                 return 5
-            if (
-                features["left"] > features["right"] * 1.08
-                and features["anti_diag_runs"] > features["main_diag_runs"] + 0.25
-            ):
+            if f["left"] > f["right"] * 1.08 and f["anti_diag"] > f["main_diag"] + 0.25:
                 return 5
-            if features["right"] > features["left"] * 1.1 and features["row_left_50"] > 0.22:
+            if f["right"] > f["left"] * 1.1 and f["rs50_left"] > 0.22:
                 return 3
-            if features["anti_diag_runs"] > features["main_diag_runs"] + 0.2 and features["row_left_50"] < 0.26:
+            if f["anti_diag"] > f["main_diag"] + 0.2 and f["rs50_left"] < 0.26:
                 return 5
-            if features["row_left_50"] < 0.14:
+            if f["rs50_left"] < 0.14:
                 return 5
             return 3
-        if pair == {2, 8} and abs(scores[2] - scores[8]) <= 2.5:
-            if features["row_left_50"] > 0.45 and (
-                features["top"] < 0.34 or features["hole_y"] > 0.62
-            ):
+
+        if pair == {2, 8} and gap <= 2.5:
+            if f["rs50_left"] > 0.45 and (f["top"] < 0.34 or f["hole_cy"] > 0.62):
                 return 2
             return 8
-        if pair == {2, 3} and abs(scores[2] - scores[3]) <= 3.0:
-            if features["lower_left"] >= 0.415:
+
+        if pair == {2, 3} and gap <= 3.0:
+            if f["ll"] >= 0.415:
                 return 2
             return 3
-        if pair == {2, 6} and abs(scores[2] - scores[6]) <= 3.0:
-            if features["row_left_50"] >= 0.357:
+
+        if pair == {2, 6} and gap <= 3.0:
+            if f["rs50_left"] >= 0.357:
                 return 2
             return 6
-        if pair == {4, 9} and abs(scores[4] - scores[9]) <= 3.5:
-            if features["col_top_50"] >= 0.182:
+
+        if pair == {4, 9} and gap <= 3.5:
+            if f["cs50_top"] >= 0.182:
                 return 4
             return 9
-        if pair == {5, 6} and abs(scores[5] - scores[6]) <= 2.5:
-            if features["repaired_holes"] == 1.0 and features["repaired_largest_hole"] > 0.02:
+
+        if pair == {5, 6} and gap <= 2.5:
+            if f["n_rh"] == 1 and f["rep_largest"] > 0.02:
                 return 6
-            if (
-                features["bottom"] > features["top"] * 1.25
-                and features["hr80"] >= 1.8
-                and features["main_diag_runs"] >= features["anti_diag_runs"]
-            ):
+            if f["bottom"] > f["top"] * 1.25 and f["hc80"] >= 2 and f["main_diag"] >= f["anti_diag"]:
                 return 6
-            if features["row_left_20"] < 0.25:
+            if f["rs20_left"] < 0.25:
                 return 5
             return 6
-        if pair == {6, 8} and abs(scores[6] - scores[8]) <= 3.0:
-            if features["hr35"] <= 1.0:
+
+        if pair == {6, 8} and gap <= 3.0:
+            if f["hc35"] <= 1:
                 return 6
             return 8
-        if pair == {7, 9} and abs(scores[7] - scores[9]) <= 3.0:
-            if (
-                features["top"] > features["bottom"] * 1.45
-                and features["row_left_50"] > 0.45
-                and features["row_width_50"] < 0.24
-                and features["vc50"] >= 2.0
-            ):
+
+        if pair == {7, 9} and gap <= 3.0:
+            if _slashed_nine(f):
                 return 9
             return 7
-        if pair == {8, 9} and abs(scores[8] - scores[9]) <= 3.0:
-            if features["holes"] >= 2.0 or features["repaired_holes"] >= 2.0:
+
+        if pair == {8, 9} and gap <= 3.0:
+            if f["n_holes"] >= 2 or f["n_rh"] >= 2:
                 return 8
-            if features["holes"] == 1.0 and features["left"] >= features["right"] * 1.05:
+            if f["n_holes"] == 1 and f["left"] >= f["right"] * 1.05:
                 return 8
             if (
-                features["holes"] == 1.0
-                and features["hr80"] >= 1.2
-                and features["row_left_80"] < 0.24
-                and features["repaired_largest_hole"] > 0.035
-                and features["lower_left"] > features["lower_right"] * 1.35
+                f["n_holes"] == 1
+                and f["hc80"] >= 2
+                and f["rs80_left"] < 0.24
+                and f["rep_largest"] > 0.035
+                and f["ll"] > f["lr"] * 1.35
             ):
                 return 8
             return 9
-        return best_digit
 
+        return best
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     images_path = Path("train-images-idx3-ubyte.gz")
